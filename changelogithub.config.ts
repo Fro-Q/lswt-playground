@@ -1,7 +1,7 @@
 const config = {
   name: 'lswt-playground',
 
-  title: `v${version}`,
+  // title: `v${version}`,
 
   types: [
     { type: 'feat', section: '✨ Features' },
