@@ -32,7 +32,6 @@ catalogs:
     tsx: ^4.21.0
     typescript: ^5.9.3
     vue-tsc: ^3.2.2
-    zx: ^8.8.5
   frontend:
     '@vueuse/core': ^14.1.0
     markdown-it: ^14.1.0
@@ -50,9 +49,6 @@ catalogs:
     '@types/markdown-it': ^14.1.2
     '@types/node': ^25.0.3
     '@types/plotly.js-dist-min': ^2.3.4
-
-ignoredBuiltDependencies:
-  - better-sqlite3
 
 onlyBuiltDependencies:
   - '@parcel/watcher'

@@ -1,12 +1,9 @@
 import type { ChangelogConfig } from 'changelogen'
 
-const config: ChangelogConfig = {
-  name: 'nuxt-template',
-  repo: 'Fro-Q/nuxt-template',
+const config: Partial<ChangelogConfig> = {
+  repo: 'Fro-Q/lswt-playground',
 
   output: 'CHANGELOG.md',
-
-  tag: 'v',
 
   types: {
     feat: { title: '✨ Features' },
@@ -17,10 +14,6 @@ const config: ChangelogConfig = {
     build: { title: '📦 Build' },
     chore: { title: '🧺 Chores' },
     test: { title: '✅ Tests' },
-  },
-
-  filters: {
-    excludeScopes: ['wip'],
   },
 }
 

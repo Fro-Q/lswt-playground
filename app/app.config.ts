@@ -1,5 +1,5 @@
 export default defineAppConfig({
-  title: 'A Site',
+  title: 'LSWT Playground',
   theme: {
     dark: true,
   },

@@ -59,9 +59,6 @@ catalogs:
     vue-tsc:
       specifier: ^3.2.2
       version: 3.2.2
-    zx:
-      specifier: ^8.8.5
-      version: 8.8.5
   frontend:
     '@vueuse/core':
       specifier: ^14.1.0
@@ -122,6 +119,9 @@ importers:
       plotly.js-dist-min:
         specifier: catalog:frontend
         version: 3.3.1
+      tsx:
+        specifier: 'catalog:'
+        version: 4.21.0
     devDependencies:
       '@antfu/eslint-config':
         specifier: catalog:dev
@@ -204,9 +204,6 @@ importers:
       pinia:
         specifier: catalog:frontend
         version: 3.0.4(typescript@5.9.3)(vue@3.5.26(typescript@5.9.3))
-      tsx:
-        specifier: 'catalog:'
-        version: 4.21.0
       typescript:
         specifier: catalog:dev
         version: 5.9.3
@@ -219,9 +216,6 @@ importers:
       vue-tsc:
         specifier: catalog:dev
         version: 3.2.2(typescript@5.9.3)
-      zx:
-        specifier: catalog:dev
-        version: 8.8.5
 
 packages:
 
@@ -6662,11 +6656,6 @@ packages:
 
   zwitch@2.0.4:
     resolution: {integrity: sha512-bXE4cR/kVZhKZX/RjPEflHaKVhUVl85noU3v6b8apfQEc1x4A+zBxjZ4lN8LqGd6WZ3dl98pY4o717VFmoPp+A==}
-
-  zx@8.8.5:
-    resolution: {integrity: sha512-SNgDF5L0gfN7FwVOdEFguY3orU5AkfFZm9B5YSHog/UDHv+lvmd82ZAsOenOkQixigwH2+yyH198AwNdKhj+RA==}
-    engines: {node: '>= 12.17.0'}
-    hasBin: true
 
 snapshots:
 
@@ -14488,5 +14477,3 @@ snapshots:
   zod@3.25.76: {}
 
   zwitch@2.0.4: {}
-
-  zx@8.8.5: {}

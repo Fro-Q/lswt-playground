@@ -1,2 +1,2 @@
-export const appName = 'A Site'
-export const appDescription = 'A site built with Nuxt 4.'
+export const appName = 'LSWT Playground'
+export const appDescription = 'LSWT Playground'

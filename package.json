@@ -1,6 +1,6 @@
 {
   "type": "module",
-  "version": "0.0.2",
+  "version": "1.0.0",
   "private": true,
   "packageManager": "pnpm@10.19.0",
   "scripts": {
@@ -64,8 +64,7 @@
     "typescript": "catalog:dev",
     "unocss": "catalog:build",
     "vue": "catalog:frontend",
-    "vue-tsc": "catalog:dev",
-    "zx": "catalog:dev"
+    "vue-tsc": "catalog:dev"
   },
   "resolutions": {
     "@nuxt/devtools": "catalog:build",

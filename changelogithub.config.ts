@@ -1,7 +1,5 @@
-import type { Config } from 'changelogithub'
-
-const config: Config = {
-  name: 'nuxt-template',
+const config = {
+  name: 'lswt-playground',
 
   title: `v${version}`,
 

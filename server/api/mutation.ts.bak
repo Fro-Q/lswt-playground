@@ -1,0 +1,715 @@
+import process from 'node:process'
+
+interface Series { id: string, label: string, points: { t: Date, v: number }[] }
+
+function splitCSVLine(line: string): string[] {
+  const result: string[] = []
+  let current = ''
+  let inQuotes = false
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i]
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') { current += '"'; i++ }
+      else {
+        inQuotes = !inQuotes
+      }
+    }
+    else if (ch === ',' && !inQuotes) {
+      result.push(current); current = ''
+    }
+    else {
+      current += ch
+    }
+  }
+  result.push(current)
+  return result.map(s => s.trim())
+}
+
+function parseWideCSVLocal(csvText: string, idColumn: string, agg: string = 'avg'): { series: Series[], years: number[] } {
+  const lines = (csvText ?? '').split(/\r?\n/).filter(l => l.trim().length > 0)
+  if (!lines.length)
+    return { series: [], years: [] }
+  const header = splitCSVLine(lines[0] ?? '')
+  const idIdx = header.indexOf(idColumn)
+  if (idIdx < 0)
+    throw new Error('CSV 不包含指定的 id 列')
+  const timeColumns: { idx: number, t: Date }[] = []
+  for (let i = 0; i < header.length; i++) {
+    if (i === idIdx)
+      continue
+    const raw = header[i] ?? ''
+    const t = new Date(raw)
+    if (!Number.isNaN(t.getTime()))
+      timeColumns.push({ idx: i, t })
+  }
+  if (!timeColumns.length)
+    throw new Error('未检测到时间列头')
+  timeColumns.sort((a, b) => a.t.getTime() - b.t.getTime())
+
+  const yearToCols = new Map<number, number[]>()
+  for (const tc of timeColumns) {
+    const y = tc.t.getFullYear()
+    if (!yearToCols.has(y))
+      yearToCols.set(y, [])
+    yearToCols.get(y)!.push(tc.idx)
+  }
+  const years = Array.from(yearToCols.keys()).sort((a, b) => a - b)
+  const grouped = new Map<string, { label: string, values: number[][] }>()
+  for (let r = 1; r < lines.length; r++) {
+    const cols = splitCSVLine(lines[r] ?? '')
+    const id = cols[idIdx]
+    if (!id)
+      continue
+    if (!grouped.has(id))
+      grouped.set(id, { label: id, values: Array.from({ length: years.length }, () => [] as number[]) })
+    const entry = grouped.get(id)!
+    for (let yi = 0; yi < years.length; yi++) {
+      const colIndices = yearToCols.get(years[yi]) || []
+      for (const colIdx of colIndices) {
+        const raw = cols[colIdx] ?? ''
+        const v = Number(raw)
+        if (!Number.isNaN(v))
+          entry.values[yi].push(v)
+      }
+    }
+  }
+
+  function aggregateArr(arr: number[]): number | null {
+    if (!arr || arr.length === 0)
+      return null
+    switch ((agg || 'avg').toLowerCase()) {
+      case 'max': return Math.max(...arr)
+      case 'min': return Math.min(...arr)
+      case 'var': {
+        const mean = arr.reduce((s, x) => s + x, 0) / arr.length
+        const v = arr.reduce((s, x) => s + (x - mean) * (x - mean), 0) / arr.length
+        return v
+      }
+      case 'range': return Math.max(...arr) - Math.min(...arr)
+      case 'avg':
+      default: return arr.reduce((s, x) => s + x, 0) / arr.length
+    }
+  }
+
+  const out: Series[] = []
+  for (const [id, entry] of grouped.entries()) {
+    const points: { t: Date, v: number }[] = []
+    for (let yi = 0; yi < years.length; yi++) {
+      const arr = entry.values[yi]
+      const aggV = aggregateArr(arr)
+      if (aggV === null)
+        continue
+      points.push({ t: new Date(years[yi], 0, 1), v: aggV })
+    }
+    if (points.length)
+      out.push({ id, label: entry.label, points })
+  }
+  return { series: out, years }
+}
+
+function mapProcessedIdxToRaw(idx: number, diffOrder: number) {
+  if (typeof idx !== 'number' || idx < 0)
+    return -1
+  const shift = Math.max(0, diffOrder)
+  return idx + shift
+}
+
+function pettittTest(arr: number[], minSegmentLength = 1): { Kmax: number, Kvals: number[], changeIndex: number, p: number } {
+  const n = arr.length
+  const Kvals = Array.from({ length: n }, () => 0)
+  for (let t = 0; t < n; t++) {
+    let Kt = 0
+    for (let i = 0; i <= t; i++) {
+      for (let j = t + 1; j < n; j++) {
+        const diff = arr[i] - arr[j]
+        if (diff > 0)
+          Kt += 1
+        else if (diff < 0)
+          Kt -= 1
+      }
+    }
+    Kvals[t] = Kt
+  }
+  let Kmax = 0; let changeIndex = -1
+  for (let t = 0; t < n; t++) {
+    if (Math.abs(Kvals[t]) > Math.abs(Kmax)) { Kmax = Kvals[t]; changeIndex = t }
+  }
+  // ensure change respects minimum segment length: both sides must have at least minSegmentLength points
+  if (changeIndex >= 0) {
+    const leftLen = changeIndex + 1
+    const rightLen = n - (changeIndex + 1)
+    if (leftLen < minSegmentLength || rightLen < minSegmentLength) {
+      changeIndex = -1
+      Kmax = 0
+    }
+  }
+  // p-value approximation
+  const K = Math.abs(Kmax)
+  const p = Math.min(1, 2 * Math.exp((-6 * K * K) / (n * n * n + n * n)))
+  return { Kmax, Kvals, changeIndex, p }
+}
+
+function olsSlope(values: number[], xs: number[]): number {
+  const n = values.length
+  if (n < 2)
+    return 0
+  const meanX = xs.reduce((s, v) => s + v, 0) / n
+  const meanY = values.reduce((s, v) => s + v, 0) / n
+  let num = 0; let den = 0
+  for (let i = 0; i < n; i++) { num += (xs[i] - meanX) * (values[i] - meanY); den += (xs[i] - meanX) * (xs[i] - meanX) }
+  return den === 0 ? 0 : num / den
+}
+
+function senSlope(values: number[], xs: number[]): number {
+  const n = values.length
+  const slopes: number[] = []
+  for (let i = 0; i < n - 1; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const dx = xs[j] - xs[i]
+      if (dx === 0)
+        continue
+      slopes.push((values[j] - values[i]) / dx)
+    }
+  }
+  if (!slopes.length)
+    return 0
+  slopes.sort((a, b) => a - b)
+  const m = slopes.length
+  return m % 2 === 1 ? slopes[(m - 1) / 2] : (slopes[m / 2 - 1] + slopes[m / 2]) / 2
+}
+
+// Sequential t-like search for mean change within a year window
+function sequentialTAvg(years: number[], values: number[], windowStart = 1990, windowEnd = 2010, minSegmentLength = 1) {
+  const n = values.length
+  if (n < 2)
+    return { changeIndex: -1, changeYear: null as number | null, stat: 0, p: null as number | null }
+  let bestStat = -Infinity; let bestIdx = -1; let bestYear: number | null = null
+  for (let t = 0; t < n - 1; t++) {
+    const y = years[t]
+    if (y < windowStart || y > windowEnd)
+      continue
+    const leftLen = t + 1; const rightLen = n - (t + 1)
+    if (leftLen < minSegmentLength || rightLen < minSegmentLength)
+      continue
+    const left = values.slice(0, t + 1)
+    const right = values.slice(t + 1)
+    const m1 = left.reduce((s, v) => s + v, 0) / left.length
+    const m2 = right.reduce((s, v) => s + v, 0) / right.length
+    const v1 = left.reduce((s, v) => s + (v - m1) * (v - m1), 0) / (left.length - 1 || 1)
+    const v2 = right.reduce((s, v) => s + (v - m2) * (v - m2), 0) / (right.length - 1 || 1)
+    const se = Math.sqrt((v1 / left.length) + (v2 / right.length))
+    const tstat = se > 0 ? Math.abs(m2 - m1) / se : 0
+    if (tstat > bestStat) { bestStat = tstat; bestIdx = t; bestYear = y }
+  }
+  return { changeIndex: bestIdx, changeYear: bestYear, stat: bestStat, p: null as number | null }
+}
+
+// Sequential t-like search for trend change (difference in OLS slopes) within a year window
+function sequentialTTrendOls(years: number[], values: number[], windowStart = 1990, windowEnd = 2010, minSegmentLength = 1) {
+  const n = values.length
+  if (n < 3)
+    return { changeIndex: -1, changeYear: null as number | null, stat: 0, p: null as number | null }
+  const xs = years.map((_y, i) => i)
+  let bestStat = -Infinity; let bestIdx = -1; let bestYear: number | null = null
+  for (let t = 0; t < n - 1; t++) {
+    const y = years[t]
+    if (y < windowStart || y > windowEnd)
+      continue
+    const leftLen = t + 1; const rightLen = n - (t + 1)
+    if (leftLen < minSegmentLength || rightLen < minSegmentLength)
+      continue
+    const x1 = xs.slice(0, t + 1); const v1 = values.slice(0, t + 1)
+    const x2 = xs.slice(t + 1); const v2 = values.slice(t + 1)
+    const s1 = olsSlope(v1, x1)
+    const s2 = olsSlope(v2, x2)
+    const diff = Math.abs(s2 - s1)
+    const stat = diff
+    if (stat > bestStat) { bestStat = stat; bestIdx = t; bestYear = y }
+  }
+  return { changeIndex: bestIdx, changeYear: bestYear, stat: bestStat, p: null as number | null }
+}
+
+// Sequential t-like search for trend change (difference in Sen slopes) within a year window
+function sequentialTTrendSen(years: number[], values: number[], windowStart = 1990, windowEnd = 2010, minSegmentLength = 1) {
+  const n = values.length
+  if (n < 3)
+    return { changeIndex: -1, changeYear: null as number | null, stat: 0, p: null as number | null }
+  const xs = years.map((_y, i) => i)
+  let bestStat = -Infinity; let bestIdx = -1; let bestYear: number | null = null
+  for (let t = 0; t < n - 1; t++) {
+    const y = years[t]
+    if (y < windowStart || y > windowEnd)
+      continue
+    const leftLen = t + 1; const rightLen = n - (t + 1)
+    if (leftLen < minSegmentLength || rightLen < minSegmentLength)
+      continue
+    const x1 = xs.slice(0, t + 1); const v1 = values.slice(0, t + 1)
+    const x2 = xs.slice(t + 1); const v2 = values.slice(t + 1)
+    const s1 = senSlope(v1, x1)
+    const s2 = senSlope(v2, x2)
+    const diff = Math.abs(s2 - s1)
+    const stat = diff
+    if (stat > bestStat) { bestStat = stat; bestIdx = t; bestYear = y }
+  }
+  return { changeIndex: bestIdx, changeYear: bestYear, stat: bestStat, p: null as number | null }
+}
+
+// compute segment cost (RSS) using cumulative sums for O(1) cost queries
+function makeCumCost(values: number[]) {
+  const n = values.length
+  const cum = Array.from({ length: n + 1 }, () => 0)
+  const cum2 = Array.from({ length: n + 1 }, () => 0)
+  for (let i = 1; i <= n; i++) {
+    cum[i] = cum[i - 1] + values[i - 1]
+    cum2[i] = cum2[i - 1] + values[i - 1] * values[i - 1]
+  }
+  function segCost(i: number, j: number) { // 1-based inclusive
+    const len = j - i + 1
+    const s = cum[j] - cum[i - 1]
+    const s2 = cum2[j] - cum2[i - 1]
+    return s2 - (s * s) / len
+  }
+  return { n: values.length, segCost }
+}
+
+// PELT with pruning using BIC-like penalty: penalty per additional parameter = log(n)
+function peltBIC_pruned(values: number[], penaltyScale = 1, minSegmentLength = 1) {
+  const n = values.length
+  if (n === 0)
+    return { changeIndices: [] as number[], changeIndex: -1, penalty: 0 }
+  const { segCost } = makeCumCost(values)
+  const penalty = Math.max(0, penaltyScale) * Math.log(Math.max(2, n)) // BIC-like
+
+  const F = Array.from({ length: n + 1 }, () => Infinity)
+  const last = Array.from({ length: n + 1 }, () => 0)
+  F[0] = -penalty
+  let R: number[] = [0]
+  const eps = 1e-9
+  for (let t = 1; t <= n; t++) {
+    let best = Infinity
+    let arg = 0
+    for (const s of R) {
+      // enforce minimum segment length: segment (s+1..t) must have length >= minSegmentLength
+      if (t - s < minSegmentLength)
+        continue
+      const cost = F[s] + segCost(s + 1, t) + penalty
+      if (cost < best) { best = cost; arg = s }
+    }
+    // fallback: if R was empty (unexpected), evaluate all s
+    if (!Number.isFinite(best)) {
+      for (let s = 0; s < t; s++) {
+        if (t - s < minSegmentLength)
+          continue
+        const cost = F[s] + segCost(s + 1, t) + penalty
+        if (cost < best) { best = cost; arg = s }
+      }
+    }
+    F[t] = best
+    last[t] = arg
+
+    // update candidate set R with pruning (do not evaluate s==t with segCost invalid)
+    const newR: number[] = []
+    for (const s of R) {
+      if (t - s < minSegmentLength)
+        continue
+      const lhs = F[s] + segCost(s + 1, t) + penalty
+      if (lhs <= F[t] + eps)
+        newR.push(s)
+    }
+    // always allow the current time t as a candidate for future steps
+    newR.push(t)
+    // If pruning removed all previous candidates (rare), include full range 0..t-1
+    if (newR.length === 1) {
+      R = Array.from({ length: t }, (_, i) => i)
+    }
+    else {
+      R = Array.from(new Set(newR))
+    }
+  }
+
+  // backtrack
+  const ends: number[] = []
+  let cur = n
+  while (cur > 0) {
+    ends.unshift(cur)
+    cur = last[cur]
+  }
+  const breaks: number[] = []
+  for (let i = 0; i < ends.length - 1; i++) breaks.push(ends[i] - 1)
+  const firstChange = breaks.length ? breaks[0] : -1
+  const finalCost = F[n]
+  const numSegments = ends.length
+  return { changeIndices: breaks, changeIndex: firstChange, penalty, finalCost, numSegments }
+}
+
+// Optimal partitioning with exact K change points (K = number of change points)
+function optimalPartitionK(values: number[], K: number, minSegmentLength = 1) {
+  const n = values.length
+  if (n === 0)
+    return { changeIndices: [] as number[], changeIndex: -1 }
+  const { segCost } = makeCumCost(values)
+  const maxSegments = K + 1
+  // D[m][t]: minimal cost for first t points with m segments (1-based m,t)
+  const D: number[][] = Array.from({ length: maxSegments + 1 }, () => Array.from({ length: n + 1 }, () => Infinity))
+  const opt: number[][] = Array.from({ length: maxSegments + 1 }, () => Array.from({ length: n + 1 }, () => 0))
+  // base: 1 segment (only valid if t >= minSegmentLength)
+  for (let t = 1; t <= n; t++) D[1][t] = (t >= minSegmentLength) ? segCost(1, t) : Infinity
+  for (let m = 2; m <= maxSegments; m++) {
+    // minimal t to allow m segments each of minSegmentLength
+    const tStart = Math.max(m * minSegmentLength, m)
+    for (let t = tStart; t <= n; t++) {
+      let best = Infinity; let arg = 0
+      // s must allow m-1 segments in first s points and a final segment of length >= minSegmentLength -> s from (m-1)*minSegmentLength to t - minSegmentLength
+      const sStart = Math.max((m - 1) * minSegmentLength, m - 1)
+      const sEnd = t - minSegmentLength
+      for (let s = sStart; s <= sEnd; s++) {
+        const c = D[m - 1][s] + segCost(s + 1, t)
+        if (c < best) { best = c; arg = s }
+      }
+      D[m][t] = best; opt[m][t] = arg
+    }
+  }
+  // backtrack segments
+  const ends: number[] = []
+  let curT = n; let m = maxSegments
+  while (m > 0) {
+    ends.unshift(curT)
+    const s = opt[m][curT] || 0
+    curT = s
+    m -= 1
+    if (curT === 0 && m > 0) { // no more splits
+      // fill with zeros
+      while (m > 0) { ends.unshift(0); m-- }
+      break
+    }
+  }
+  const breaks: number[] = []
+  for (let i = 0; i < ends.length - 1; i++) breaks.push(ends[i] - 1)
+  const firstChange = breaks.length ? breaks[0] : -1
+  return { changeIndices: breaks, changeIndex: firstChange }
+}
+
+export default defineEventHandler(async (event) => {
+  const query = getQuery(event) as {
+    idColumn?: string
+    id?: string
+    agg?: string
+    method?: string
+    startYear?: string
+    endYear?: string
+  }
+  const idColumn = (query.idColumn ?? '').trim()
+  const agg = (query.agg ?? 'avg').trim().toLowerCase()
+  const method = (query.method ?? 'pettitt').trim().toLowerCase()
+  const startYear = query.startYear ? Number(query.startYear) : undefined
+  const endYear = query.endYear ? Number(query.endYear) : undefined
+  const windowStart = (query as any).windowStart !== undefined ? Number((query as any).windowStart) : 1990
+  const windowEnd = (query as any).windowEnd !== undefined ? Number((query as any).windowEnd) : 2010
+  const numChanges = (query as any).numChanges ? Number((query as any).numChanges) : undefined
+  const penaltyScale = (query as any).penaltyScale !== undefined ? Number((query as any).penaltyScale) : 1
+  const penaltyScan = (query as any).penaltyScan === '1' || (query as any).penaltyScan === 'true'
+  const minSegmentLength = (query as any).minSegmentLength !== undefined ? Math.max(1, Math.floor(Number((query as any).minSegmentLength) || 1)) : 3
+  const smoothWindow = (query as any).smoothWindow !== undefined ? Math.max(0, Math.floor(Number((query as any).smoothWindow) || 0)) : 0
+  const diffOrder = (query as any).diffOrder !== undefined ? Math.max(0, Math.floor(Number((query as any).diffOrder) || 0)) : 0
+  if (!idColumn) { setResponseStatus(event, 400); return { error: 'idColumn is required' } }
+
+  try {
+    const { readFile } = await import('node:fs/promises')
+    const { join } = await import('node:path')
+    const csvPath = join(process.cwd(), 'public', 'lake_temperature.csv')
+    const csvText = await readFile(csvPath, 'utf-8')
+    if (!csvText) { setResponseStatus(event, 500); return { error: 'Failed to read CSV' } }
+    const parsed = parseWideCSVLocal(csvText, idColumn, agg)
+    const series = parsed.series
+
+    const id = (query.id ?? '').trim()
+    // helper: apply preprocessing (moving average window, then differencing) returning aligned years
+    function preprocess(values: number[], years: number[]): { vals: number[], years: number[] } {
+      let x = values.slice()
+      let ys = years.slice()
+      // moving average smoothing
+      if (smoothWindow && smoothWindow > 1) {
+        const w = smoothWindow
+        const out: number[] = []
+        const prefix: number[] = [0]
+        for (let i = 0; i < x.length; i++) prefix.push(prefix[prefix.length - 1] + x[i])
+        for (let i = 0; i < x.length; i++) {
+          const a = Math.max(0, i - Math.floor((w - 1) / 2))
+          const b = Math.min(x.length - 1, i + Math.floor(w / 2))
+          const len = b - a + 1
+          const sum = prefix[b + 1] - prefix[a]
+          out.push(sum / len)
+        }
+        x = out
+      }
+      // differencing
+      if (diffOrder && diffOrder > 0) {
+        for (let d = 0; d < diffOrder; d++) {
+          const diff: number[] = []
+          for (let i = 1; i < x.length; i++) diff.push(x[i] - x[i - 1])
+          x = diff
+          ys = ys.slice(1)
+        }
+      }
+      return { vals: x, years: ys }
+    }
+
+    if (!id) {
+      // run Pettitt on all series and return summary, then apply Benjamini-Hochberg FDR correction
+      const rows: any[] = []
+      for (const s of series) {
+        // clip by requested years
+        const valsAll = s.points.map(p => ({ year: p.t.getFullYear(), v: p.v }))
+        const clippedPts = valsAll.filter(pt => (startYear === undefined || pt.year >= startYear) && (endYear === undefined || pt.year <= endYear))
+        const rawVals = clippedPts.map(pt => pt.v)
+        const clippedYears = clippedPts.map(pt => pt.year)
+        const { vals: procVals, years: procYears } = preprocess(rawVals, clippedYears)
+        // adjust minimal length after differencing potentially shortens series
+        if (procVals.length < Math.max(6, minSegmentLength * 2)) { rows.push({ id: s.id, ok: false }); continue }
+        let res: any = null
+        // support standard Pettitt and additional methods
+        if (method === 'pettitt') {
+          res = pettittTest(procVals, minSegmentLength)
+        }
+        else if (method === 'pettit-dt' || method === 'pettitt-dt' || method === 'pettit dt' || method === 'pettitt dt') {
+          // compute first differences (length n-1) and run Pettitt on them
+          const diff = [] as number[]
+          for (let i = 1; i < procVals.length; i++) diff.push(procVals[i] - procVals[i - 1])
+          // run Pettitt on diff series; note that returned indices refer to diff array (0..n-2)
+          const dtRes = pettittTest(diff, Math.max(1, minSegmentLength - 1))
+          // map result back so that changeIndex refers to original-series index (shift +1)
+          const mapIdx = (typeof dtRes.changeIndex === 'number' && dtRes.changeIndex >= 0) ? dtRes.changeIndex + 1 : -1
+          res = { ...dtRes, changeIndex: mapIdx }
+        }
+        else if (method === 'pelt-bic') {
+          if (typeof numChanges === 'number' && !Number.isNaN(numChanges))
+            res = optimalPartitionK(procVals, numChanges, minSegmentLength)
+          else res = peltBIC_pruned(procVals, penaltyScale, minSegmentLength)
+        }
+        else if (method === 'sequential-t-avg' || method === 'sequential t avg') {
+          const r = sequentialTAvg(procYears, procVals, windowStart, windowEnd, minSegmentLength)
+          res = { changeIndex: r.changeIndex, p: r.p, stat: r.stat } as any
+        }
+        else if (method === 'sequential-t-trend-ols' || method === 'sequential t trend ols' || method === 'sequential-t-trend' || method === 'sequential t trend') {
+          const r = sequentialTTrendOls(procYears, procVals, windowStart, windowEnd, minSegmentLength)
+          res = { changeIndex: r.changeIndex, p: r.p, stat: r.stat } as any
+        }
+        else if (method === 'sequential-t-trend-sen' || method === 'sequential t trend sen') {
+          const r = sequentialTTrendSen(procYears, procVals, windowStart, windowEnd, minSegmentLength)
+          res = { changeIndex: r.changeIndex, p: r.p, stat: r.stat } as any
+        }
+        else { rows.push({ id: s.id, ok: false }); continue }
+        const chIdxProc = res.changeIndex
+        let chIdx = mapProcessedIdxToRaw(chIdxProc, diffOrder)
+        let chYear = null
+        if (typeof chIdx === 'number' && chIdx >= 0 && chIdx < clippedYears.length) {
+          chYear = clippedYears[chIdx]
+        }
+        else { chIdx = -1; chYear = null }
+        // compute pre/post stats for summary if we have a valid changeIndex
+        let preMean: number | null = null; let postMean: number | null = null
+        let preVar: number | null = null; let postVar: number | null = null
+        let olsPreSlope: number | null = null; let olsPostSlope: number | null = null
+        let senPreSlope: number | null = null; let senPostSlope: number | null = null
+        if (typeof chIdx === 'number' && chIdx >= 0 && chIdx < rawVals.length) {
+          const preVals = rawVals.slice(0, chIdx + 1)
+          const postVals = rawVals.slice(chIdx + 1)
+          const preXs = clippedYears.slice(0, chIdx + 1)
+          const postXs = clippedYears.slice(chIdx + 1)
+          const mean = (arr: number[]) => arr.reduce((s, x) => s + x, 0) / arr.length
+          const variance = (arr: number[]) => { const m = mean(arr); return arr.reduce((s, x) => s + (x - m) * (x - m), 0) / arr.length }
+          if (preVals.length) { preMean = mean(preVals); preVar = variance(preVals); olsPreSlope = olsSlope(preVals, preXs); senPreSlope = senSlope(preVals, preXs) }
+          if (postVals.length) { postMean = mean(postVals); postVar = variance(postVals); olsPostSlope = olsSlope(postVals, postXs); senPostSlope = senSlope(postVals, postXs) }
+        }
+        rows.push({ id: s.id, ok: true, changeIndex: chIdx, changeYear: chYear, p: res.p ?? null, stat: (res.stat ?? null), penalty: res.penalty ?? null, numSegments: (res.numSegments ?? null), finalCost: (res.finalCost ?? null), method, startYear: startYear ?? null, endYear: endYear ?? null, windowStart, windowEnd, preMean, postMean, preVar, postVar, olsPreSlope, olsPostSlope, senPreSlope, senPostSlope })
+      }
+      // collect p-values and perform BH FDR correction
+      // if some methods did not return p (e.g., sequential-t variants), approximate p by rank of stat
+      const missingP: { idx: number, stat: number }[] = []
+      rows.forEach((r, i) => {
+        if (r && r.ok && (r.p === null || r.p === undefined) && typeof r.stat === 'number' && Number.isFinite(r.stat))
+          missingP.push({ idx: i, stat: r.stat as number })
+      })
+      if (missingP.length) {
+        missingP.sort((a, b) => b.stat - a.stat) // larger stat -> smaller p
+        const k = missingP.length
+        missingP.forEach((item, rank) => {
+          const pseudoP = Math.min(1, (rank + 1) / (k + 1))
+          rows[item.idx].p = pseudoP
+        })
+      }
+      const m = rows.filter(r => r.ok && typeof r.p === 'number').length
+      if (m > 0) {
+        // create array of {p, idx}
+        const pv: { p: number, idx: number }[] = []
+        rows.forEach((r, i) => {
+          if (r.ok && typeof r.p === 'number')
+            pv.push({ p: r.p as number, idx: i })
+        })
+        pv.sort((a, b) => a.p - b.p)
+        const q: number[] = Array.from({ length: pv.length }).map(() => 1)
+        for (let i = 0; i < pv.length; i++) {
+          const rank = i + 1
+          q[i] = Math.min(1, pv[i].p * pv.length / rank)
+        }
+        // enforce monotonicity from largest to smallest
+        for (let i = pv.length - 2; i >= 0; i--) {
+          if (q[i] > q[i + 1])
+            q[i] = q[i + 1]
+        }
+        // write back adjusted p to rows
+        for (let i = 0; i < pv.length; i++) {
+          const origIdx = pv[i].idx;
+          (rows[origIdx] as any).p_adj = q[i]
+        }
+      }
+      return { summary: rows }
+    }
+
+    const found = series.find(s => s.id === id)
+    if (!found) { setResponseStatus(event, 404); return { error: 'id not found' } }
+    // clip by start/end year for detailed computation
+    const ptsAll = found.points.map(p => ({ year: p.t.getFullYear(), t: p.t, v: p.v }))
+    const clipped = ptsAll.filter(pt => (startYear === undefined || pt.year >= startYear) && (endYear === undefined || pt.year <= endYear))
+    const rawVals = clipped.map(p => p.v)
+    const rawYears = clipped.map(p => p.year)
+    const { vals: procVals, years: procYears } = preprocess(rawVals, rawYears)
+    if (procVals.length < Math.max(6, minSegmentLength * 2))
+      return { error: 'not enough data points', ok: false }
+    let pRes: any = null
+    if (method === 'pettitt') {
+      pRes = pettittTest(procVals, minSegmentLength)
+    }
+    else if (method === 'pettit-dt' || method === 'pettitt-dt' || method === 'pettit dt' || method === 'pettitt dt') {
+      const diff = [] as number[]
+      for (let i = 1; i < procVals.length; i++) diff.push(procVals[i] - procVals[i - 1])
+      const dtRes = pettittTest(diff, Math.max(1, minSegmentLength - 1))
+      const mapIdx = (typeof dtRes.changeIndex === 'number' && dtRes.changeIndex >= 0) ? dtRes.changeIndex + 1 : -1
+      pRes = { ...dtRes, changeIndex: mapIdx }
+    }
+    else if (method === 'pelt-bic') {
+      if (penaltyScan) {
+        // run a quick scan of penaltyScale values for diagnostics
+        const scales = [0, 0.0001, 0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5]
+        const scan: any[] = []
+        for (const s of scales) {
+          const r = peltBIC_pruned(procVals, s, minSegmentLength)
+          scan.push({ penaltyScale: s, penalty: r.penalty ?? null, numSegments: r.numSegments ?? (r.changeIndices ? (r.changeIndices.length + 1) : 1), changeIndices: r.changeIndices })
+        }
+        return { ok: true, id: found.id, label: found.label, method, startYear: startYear ?? null, endYear: endYear ?? null, scan }
+      }
+      if (typeof numChanges === 'number' && !Number.isNaN(numChanges))
+        pRes = optimalPartitionK(procVals, numChanges, minSegmentLength)
+      else pRes = peltBIC_pruned(procVals, penaltyScale, minSegmentLength)
+    }
+    else if (method === 'sequential-t-avg' || method === 'sequential t avg') {
+      pRes = sequentialTAvg(procYears, procVals, windowStart, windowEnd, minSegmentLength)
+    }
+    else if (method === 'sequential-t-trend-ols' || method === 'sequential t trend ols' || method === 'sequential-t-trend' || method === 'sequential t trend') {
+      pRes = sequentialTTrendOls(procYears, procVals, windowStart, windowEnd, minSegmentLength)
+    }
+    else if (method === 'sequential-t-trend-sen' || method === 'sequential t trend sen') {
+      pRes = sequentialTTrendSen(procYears, procVals, windowStart, windowEnd, minSegmentLength)
+    }
+    else { setResponseStatus(event, 400); return { error: 'unknown method' } }
+    function mean(arr: number[]) { return arr.reduce((s, x) => s + x, 0) / arr.length }
+    function variance(arr: number[]) { const m = mean(arr); return arr.reduce((s, x) => s + (x - m) * (x - m), 0) / arr.length }
+    // compute 95% CI for means
+    function meanCI(arr: number[]) {
+      const n = arr.length
+      if (n < 2)
+        return null
+      const m = mean(arr)
+      const sd = Math.sqrt(arr.reduce((s, x) => s + (x - m) * (x - m), 0) / (n - 1))
+      const se = sd / Math.sqrt(n)
+      const z = 1.96
+      return [m - z * se, m + z * se]
+    }
+
+    // build changeIndices array
+    let changeIndices: number[] = []
+    if (Array.isArray(pRes.changeIndices))
+      changeIndices = pRes.changeIndices.map((v: any) => Number(v)).filter((v: number) => Number.isFinite(v))
+    else if (typeof pRes.changeIndex === 'number' && pRes.changeIndex >= 0)
+      changeIndices = [pRes.changeIndex]
+    // map processed indices back to raw positions
+    const rawChangeIndices = changeIndices.map(ci => mapProcessedIdxToRaw(ci, diffOrder)).filter(ci => ci >= 0 && ci < rawVals.length)
+    // build per-segment slices
+    const segmentVals: number[][] = []
+    const segmentYears: number[][] = []
+    let start = 0
+    for (const ci of rawChangeIndices) {
+      segmentVals.push(rawVals.slice(start, ci + 1))
+      segmentYears.push(rawYears.slice(start, ci + 1))
+      start = ci + 1
+    }
+    // final segment
+    segmentVals.push(rawVals.slice(start))
+    segmentYears.push(rawYears.slice(start))
+
+    const segmentMeans = segmentVals.map(sv => sv.length ? mean(sv) : Number.NaN)
+    const segmentVars = segmentVals.map(sv => sv.length ? variance(sv) : Number.NaN)
+    const segmentMeanCIs = segmentVals.map(sv => sv.length ? meanCI(sv) : null)
+    const segmentOls = segmentVals.map((sv, i) => sv.length ? olsSlope(sv, segmentYears[i]) : 0)
+    const segmentSen = segmentVals.map((sv, i) => sv.length ? senSlope(sv, segmentYears[i]) : 0)
+    const segmentOlsPerDecade = segmentOls.map(s => s * 10)
+    const segmentSenPerDecade = segmentSen.map(s => s * 10)
+
+    const changeYears = rawChangeIndices.map(ci => (typeof ci === 'number' && ci >= 0 && ci < rawYears.length) ? rawYears[ci] : null).filter(y => y !== null) as number[]
+    // for backward compatibility expose pre/post fields as first/last segment
+    const preMean = segmentMeans[0]; const postMean = segmentMeans[segmentMeans.length - 1]
+    const preVar = segmentVars[0]; const postVar = segmentVars[segmentVars.length - 1]
+    const preMeanCI = segmentMeanCIs[0] ?? null; const postMeanCI = segmentMeanCIs[segmentMeanCIs.length - 1] ?? null
+    const olsPre = segmentOls[0]; const olsPost = segmentOls[segmentOls.length - 1]
+    const senPre = segmentSen[0]; const senPost = segmentSen[segmentSen.length - 1]
+
+    // bootstrap logic removed as requested
+
+    const firstChangeIndex = rawChangeIndices.length ? rawChangeIndices[0] : -1
+    return {
+      ok: true,
+      id: found.id,
+      label: found.label,
+      changeIndex: firstChangeIndex,
+      changeYear: (typeof firstChangeIndex === 'number' && firstChangeIndex >= 0 && firstChangeIndex < rawYears.length) ? rawYears[firstChangeIndex] : null,
+      changeIndices: rawChangeIndices,
+      changeYears,
+      p: pRes.p ?? null,
+      stat: (pRes.stat ?? null),
+      penalty: pRes.penalty ?? null,
+      finalCost: pRes.finalCost ?? null,
+      numSegments: pRes.numSegments ?? null,
+      startYear: startYear ?? null,
+      endYear: endYear ?? null,
+      preMean,
+      postMean,
+      preVar,
+      postVar,
+      preMeanCI,
+      postMeanCI,
+      olsPreSlope: olsPre,
+      olsPostSlope: olsPost,
+      senPreSlope: senPre,
+      senPostSlope: senPost,
+      // also include per-decade slope fields for convenience
+      olsPreSlopePerDecade: olsPre * 10,
+      olsPostSlopePerDecade: olsPost * 10,
+      senPreSlopePerDecade: senPre * 10,
+      senPostSlopePerDecade: senPost * 10,
+      // per-segment stats
+      segmentMeans,
+      segmentVars,
+      segmentMeanCIs,
+      segmentOls,
+      segmentSen,
+      segmentOlsPerDecade,
+      segmentSenPerDecade,
+      segmentYears,
+      points: clipped.map(p => ({ t: p.t, v: p.v })),
+    }
+  }
+  catch (err: any) {
+    setResponseStatus(event, 500)
+    return { error: String(err) }
+  }
+})

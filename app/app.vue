@@ -36,7 +36,6 @@ useHead({
   src: url('assets/fonts/LXGWNeoZhiSongPlus.ttf');
 }
 
-
 html,
 body,
 #__nuxt {
